@@ -1,0 +1,5 @@
+lark-oapi>=1.7.5
+numpy>=2.0
+imageio-ffmpeg>=0.6.0
+faster-whisper>=1.2.1
+Pillow>=10.0
