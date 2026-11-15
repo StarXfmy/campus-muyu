@@ -2,7 +2,8 @@
 
 - 人设：从《木鱼提示词合集》抽 C 节正文；按请求场景（群聊 / 私聊主人 / 私聊他人）
   追加一行【当前场景】说明，其余规则全由 C 版自己管。
-- 回复：调 app.agent.agent.run()
+- 回复：调 handlers.answer_blocks()，与飞书端同一条主链（规则路由 → 题库兜底 → Agent）。
+  微信端只多两件事：[[IMG:路径]] 发图指令、卡片 markdown 清洗成纯文本。
 - 上下文：写 conversations 表，chat_id 加 wx: 前缀，与飞书的会话隔离。
 - 只监听 127.0.0.1；带 Bearer token 鉴权。
 
@@ -20,6 +21,7 @@ import os
 import re
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -28,9 +30,16 @@ sys.path.insert(0, str(ROOT))
 
 from app import config as app_config  # noqa: E402
 
-PERSONA_MD = Path(os.getenv(
-    "WX_PERSONA_MD",
-    r"C:\Users\lenovo\Desktop\AI Agent\Qoder CN\木鱼人设\木鱼提示词合集.md",
+# 人设文档搬家过一次（原来在 Qoder CN\木鱼人设，现在在 Qoder CN\飞书校园助手\木鱼人设）。
+# 路径写死成旧位置时读不到文件，load_c_persona 会静默返回空串——
+# 结果微信端一直在「没有人设」的状态下说话，/health 里的 personaChars 就是 0。
+# 这里按候选顺序取第一个真实存在的，两个位置都认。
+_PERSONA_CANDIDATES = [
+    Path(r"C:\Users\lenovo\Desktop\AI Agent\Qoder CN\飞书校园助手\木鱼人设\木鱼提示词合集.md"),
+    Path(r"C:\Users\lenovo\Desktop\AI Agent\Qoder CN\木鱼人设\木鱼提示词合集.md"),
+]
+PERSONA_MD = Path(os.getenv("WX_PERSONA_MD") or next(
+    (p for p in _PERSONA_CANDIDATES if p.exists()), _PERSONA_CANDIDATES[0]
 ))
 PORT = int(os.getenv("WX_BRIDGE_PORT", "8790"))
 TOKEN = os.getenv("WX_BRIDGE_TOKEN", "dev-token")
@@ -71,7 +80,12 @@ LAYOUT_RULE = (
     "用户问「有什么」就是想看完整清单，压缩等于没查。\n\n"
     "【不许只说不做】\n"
     "禁止说「我看看」「稍等」「给你找找」「马上」这类话然后不给结果。"
-    "要么这一条就把答案写出来，要么直接说查不到、缺什么信息。"
+    "要么这一条就把答案写出来，要么直接说查不到、缺什么信息。\n\n"
+    "【微信特色】\n"
+    "别写小作文，但也别变冷淡：闲聊、观点、安慰最多 4 段，段与段之间空一行，\n"
+    "语气照旧活泼，该多一句吐槽或关心就多一句，别为了短把人气砍掉；\n"
+    "不用「•」「-」这类列表符号，也不写「首先/其次/总之」这种书面腔；\n"
+    "但清单类问题（活动、课表、菜、消费明细）照上面的规则逐条列全，不许为了短而省略。"
 )
 
 
@@ -109,57 +123,25 @@ def build_scene(payload: dict) -> str:
     elif is_master:
         scene = f"这是微信私聊，对方是绑定主人「{who}」。可以称呼「主人」。"
     else:
-        scene = f"这是微信私聊，对方是「{who}」，不是主人。称呼用「你」。"
+        scene = (
+            f"这是微信私聊，对方是「{who}」，不是主人。"
+            "称呼只能用「你」；不许叫主人，也不许透露主人的名字、课表、余额、消费、邮件、行程这些信息。"
+        )
     return f"{stamp}\n{scene}"
 
 
 # 清单类问题走原文直出：模型转述一定会把时间地点概括掉（实测 742 字 → 120 字）
-# 只要问到活动/二课就给完整清单：模型转述一定丢时间地点，还会说「我看看」然后没了
-_ACTIVITY_LIST_RE = re.compile(r"(活动|讲座|二课|第二课堂)")
-_ACTIVITY_EXCLUDE_RE = re.compile(r"(报名|推荐|适合|哪个好|值得|哪个更|怎么选|取消)")
-_CANTEEN_RE = re.compile(r"(食堂|吃啥|吃什么|好吃|菜品|档口)")
-_CANTEEN_EXCLUDE_RE = re.compile(r"(几点开|开门|关门|营业|营业时间|几点关门|价格多少)")
-_SCHEDULE_LIST_RE = re.compile(r"(有什么课|有啥课|什么课|课表|课程表|几节课|有哪些课)")
-_SCHEDULE_EXCLUDE_RE = re.compile(r"(几点下课|几点上课|什么时候上|哪个老师|谁教|空教室|没课吧|二课)")
-_NEEDS_OPINION_RE = re.compile(r"(推荐|适合|哪个好|值得|哪个更|怎么选)")
-
-
-def _schedule_scope(text: str) -> str:
-    if "明天" in text or "明日" in text:
-        return "tomorrow"
-    if "后天" in text:
-        return "day_after_tomorrow"
-    if "下周" in text:
-        return "next_week"
-    if "这周" in text or "本周" in text:
-        return "this_week"
-    return "today"
+# 这些直出规则已统一收到 handlers.answer() 里，微信端不再自己判领域，
+# 只保留下面「要图」和呈现层清洗两件微信端独有的事。
 
 
 def _strip_md(text: str) -> str:
-    return re.sub(r"\*\*(.+?)\*\*", r"\1", text or "").strip()
+    """飞书回的是卡片 markdown，微信是纯文本：剥掉星号。
 
-
-def _money_kind(text: str, chat_id: str | None) -> str | None:
-    """数字类问题认准了谁，才敢直出。认不准就交给模型（它会追问）。"""
-    if re.search(r"(电费|多少电|还剩多少电)", text):
-        return "electric"
-    # 「饭卡花了多少」问的是流水不是余额，这条必须在余额前面
-    if re.search(r"(花了多少|消费|账单|花销)", text):
-        return "consumption"
-    if re.search(r"(饭卡|校园卡|一卡通|余额)", text):
-        return "balance"
-    if re.search(r"(还剩多少|还有多少|剩多少)", text) and chat_id:
-        from app.agent import context
-
-        prev = context.last_reply(chat_id) or ""
-        if "消费记录" in prev:
-            return "consumption"
-        if "电费" in prev:
-            return "electric"
-        if "校园卡" in prev:
-            return "balance"
-    return None
+    顺手把秒去掉（15:00:00 → 15:00），微信里那一串秒是噪音。
+    """
+    out = re.sub(r"\*\*(.+?)\*\*", r"\1", text or "").strip()
+    return re.sub(r"(\d{1,2}:\d{2}):00", r"\1", out)
 
 
 _SCHEDULE_IMAGE_RE = re.compile(r"(课表图|课程表图|课表.*图片|图片.*课表|画个课表|画一下课表|把课表画)")
@@ -202,62 +184,30 @@ def _image_answer(text: str, chat_id: str | None, is_master: bool) -> str | None
     return "消费图给你\n[[IMG:%s]]" % path
 
 
-def _direct_answer(text: str, chat_id: str | None = None, is_master: bool = False) -> str | None:
-    """能直出就别让模型措辞。返回 None 表示交给 Agent。
+def _multi_reply(text: str, chat_id: str, is_master: bool = False) -> str | None:
+    """微信入口与飞书走同一条主链：handlers.answer_blocks。
 
-    模型转述清单一定会砍掉时间地点（实测活动 742 字 → 120 字、课表 60 字 → 20 字），
-    所以这两类是原文直出。
+    以前这里自己写了半套：只有活动/食堂/课表/金额/学期报告五类直出，其余全交给
+    模型自由发挥，于是飞书能答的「快递在哪里取」（走题库原文直出）微信答不出。
+    现在规则路由、题库兜底、纠正层、写操作直出、链接抓取、多问题分段全部共用一份。
+
+    只有「要图」留在微信端：[[IMG:路径]] 是桥接解析的发图指令，飞书用卡片。
     """
     from app.agent import handlers
 
-    # 要图的请求排在最前面：它和「课表/消费」共用关键词，先拦下来
     image_reply = _image_answer(text, chat_id, is_master)
     if image_reply:
         return image_reply
 
-    if _ACTIVITY_LIST_RE.search(text) and not _NEEDS_OPINION_RE.search(text):
-        campus = handlers._wanted_campus(text)
-        body = handlers.handle_activities(campus=campus)
-        # 2026-10-31 15:00:00 → 15:00，秒在微信里是噪音
-        return re.sub(r"(\d{1,2}:\d{2}):00", r"\1", body)
-
-    # 食堂也直出：模型会把「一楼」的店混进「二楼推荐」，价格也丢
-    if _CANTEEN_RE.search(text) and not _CANTEEN_EXCLUDE_RE.search(text):
-        return _strip_md(handlers.handle_canteen(text))
-
-    if _SCHEDULE_LIST_RE.search(text) and not _SCHEDULE_EXCLUDE_RE.search(text):
-        return handlers.handle_schedule(_schedule_scope(text))
-
-    # 金额类必须直出：实测模型会照着正确数字另编一个（81.34→128.50、474.82→0.00）
-    kind = _money_kind(text, chat_id)
-    if kind == "balance":
-        return _strip_md(handlers.handle_balance())
-    if kind == "electric":
-        return _strip_md(handlers.handle_electric())
-    if kind == "consumption":
-        return _strip_md(handlers.handle_consumption())
-
-    if re.search(r"(学期报告|学期总结|这学期过得)", text):
-        return _strip_md(handlers.handle_semester_report())
-
-    return None
-
-
-def _multi_reply(text: str, chat_id: str, is_master: bool = False) -> str | None:
-    """一句话里问了几件事就分段各答一遍；单问题保持原来的整段回答。"""
-    from app.agent import handlers
-
-    parts = handlers.split_multi_intents(text, chat_id)
-    if len(parts) < 2:
-        return _direct_answer(text, chat_id, is_master) or agent_mod.run(text, chat_id)
-
-    blocks: list[str] = []
-    for part in parts:
-        piece = _direct_answer(part, chat_id, is_master) or agent_mod.run(part, chat_id)
-        if not piece:
-            return agent_mod.run(text, chat_id)
-        blocks.append(piece.strip())
-    return "\n\n".join(blocks) if len(blocks) >= 2 else agent_mod.run(text, chat_id)
+    try:
+        blocks = handlers.answer_blocks(text, chat_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chat] answer_blocks 失败，回退 agent：{exc!r}", flush=True)
+        blocks = []
+    reply = _strip_md("\n\n".join(b for b in blocks if b))
+    if reply:
+        return reply
+    return _strip_md(agent_mod.run(text, chat_id) or "")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -273,6 +223,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         return not TOKEN or self.headers.get("authorization", "") == f"Bearer {TOKEN}"
+
+    def _audit(self, chat_id: str, text: str, started: float, ok: bool) -> None:
+        """记一条审计：意图、耗时、成功与否。失败不影响回复。"""
+        try:
+            from app.agent import router as _router
+            from app.ops import audit as audit_mod
+
+            try:
+                intent = _router.detect(text, chat_id).name
+            except Exception:
+                intent = ""
+            audit_mod.record(
+                chat_id,
+                intent,
+                latency_ms=int((time.time() - started) * 1000),
+                ok=ok,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[audit] 写入失败：{exc!r}", flush=True)
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
@@ -311,6 +280,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         text = str(payload.get("text") or "").strip()
+        # 微信桥有时把「wxid_x:」群前缀一起传过来：知识库检索拿整串切片，
+        # 脏前缀会把不相干的问题命中（实测「wxid_x: @木鱼 好久不见」答成食堂）
+        text = re.sub(r"^[A-Za-z0-9_\-]{4,}:\s*", "", text).strip()
+        t_start = time.time()
         if not text:
             self._send(200, {"reply": ""})
             return
@@ -328,10 +301,15 @@ class Handler(BaseHTTPRequestHandler):
         if reply:
             try:
                 ctx_mod.remember(chat_id, text, "wechat", reply)
+                # 飞书那条链还多记一层「30 分钟内的最近两轮摘要」，微信端之前漏了，
+                # 于是「那明天呢」这类追问接不上前面的话题
+                ctx_mod.record_turn(chat_id, text, reply)
             except Exception as exc:  # noqa: BLE001
                 print(f"[chat] 上下文写入失败：{exc!r}", flush=True)
+            self._audit(chat_id, text, t_start, True)
             self._send(200, {"reply": reply})
         else:
+            self._audit(chat_id, text, t_start, False)
             self._send(200, {"reply": None, "reason": "agent returned empty"})
 
     def log_message(self, fmt: str, *args) -> None:  # 别刷屏，只留错误

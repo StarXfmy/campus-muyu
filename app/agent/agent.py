@@ -44,7 +44,14 @@ SYSTEM_PROMPT = """今天是 {today}。说话风格和安全边界见人设，�
     没真搜过，不许声称「网上没有」，也不许编一个解释糊弄过去。
 16. 「吃完去哪」「下午去哪」「今天去哪自习」这类安排问题，先查那天的课表（query_schedule）
     和空教室（query_empty_rooms），按空闲时段给具体建议；
-    没查课表就别列「可以去图书馆 / 体育馆 / 操场」这种放之四海皆准的清单。"""
+    没查课表就别列「可以去图书馆 / 体育馆 / 操场」这种放之四海皆准的清单。
+17. 闲聊时可以用一点大众都懂的网路热梗（破防、栓Q、显眼包、班味、情绪价值、抽象、被迫营业这类），
+    一次最多一个，别硬套、也别解释梗的意思；查数据、办事流程、政策这类正式回答不用梗。
+18. 「主人」只有一个：微信里是绑定的那个账号，飞书里是当前用户本人。
+    不是主人的对话（别人的私聊、任何群聊）里：一律称呼「你」，不许叫「主人」；
+    不许提主人的任何个人信息（名字、昵称、课表、余额、电费、消费流水、邮件、行程、住址）；
+    有人打听「你主人是谁 / 他花了多少钱 / 他课表是什么」，只说「这个本鱼不方便说」。
+"""
 
 
 # 命中这些词说明大概率要查校园数据，第一轮强制调工具，防止模型凭记忆答
@@ -54,6 +61,9 @@ _DATA_KEYWORDS = (
     "提醒", "成绩", "绩点", "老师", "上课",
     # 食堂：少了这几个词，模型不会去调 query_canteen，直接回「查不到」
     "食堂", "吃啥", "吃什么", "好吃", "菜品", "档口", "窗口",
+    # 快递同理：知识库里就有驿站位置和取件流程，不强制调工具，
+    # 闲聊模型会直接编一句「问公告栏或辅导员」
+    "快递", "驿站", "取件", "包裹", "菜鸟",
 )
 
 
@@ -67,7 +77,7 @@ _DOMAIN_TOOL = {
     "query_activities": ("活动", "讲座", "比赛"),
     "query_sunrun": ("长跑", "跑步"),
     "query_library": ("图书馆", "座位"),
-    "query_knowledge": ("规定", "奖学金", "流程"),
+    "query_knowledge": ("规定", "奖学金", "流程", "快递", "驿站", "取件", "包裹", "菜鸟"),
 }
 
 
@@ -154,6 +164,21 @@ def _wanted_tools(text: str) -> list[str]:
 def _missing_tools(text: str, used: list[str]) -> list[str]:
     """用户提到但模型没调的工具，由代码补齐。"""
     return [tool for tool in _wanted_tools(text) if tool not in used]
+
+
+# 补调时得把用户原话塞进工具的文本参数。空着传等于白补：
+# query_knowledge 的 query 为空会被知识接口直接拒（「知识库参数错误: query 必填」），
+# 模型看到这条报错只能说「不确定」，反而比不调更差。
+_AUTO_TEXT_ARG = {
+    "query_knowledge": "query",
+    "query_canteen": "keyword",
+    "query_college": "keyword",
+}
+
+
+def _auto_args(tool: str, text: str) -> dict:
+    key = _AUTO_TEXT_ARG.get(tool)
+    return {key: text} if key else {}
 
 
 def _domain_hint(text: str) -> str:
@@ -437,7 +462,8 @@ def run(text: str, chat_id: str | None = None) -> str | None:
             if missing:
                 fake_calls = [
                     {"id": f"auto_{index}", "type": "function",
-                     "function": {"name": tool, "arguments": "{}"}}
+                     "function": {"name": tool,
+                                  "arguments": json.dumps(_auto_args(tool, text), ensure_ascii=False)}}
                     for index, tool in enumerate(missing)
                 ]
                 messages.append({"role": "assistant", "content": "", "tool_calls": fake_calls})
@@ -447,7 +473,7 @@ def run(text: str, chat_id: str | None = None) -> str | None:
                     messages.append({
                         "role": "tool",
                         "tool_call_id": call["id"],
-                        "content": execute(tool, {}, text, chat_id),
+                        "content": execute(tool, _auto_args(tool, text), text, chat_id),
                     })
 
     # 两轮之后还没给答案：拿最后一次工具结果，让模型做一次纯措辞

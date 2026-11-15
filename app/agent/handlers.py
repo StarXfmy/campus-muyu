@@ -135,6 +135,12 @@ def answer(text: str, chat_id: str | None = None, intent: router.Intent | None =
         _handle_correction(text or "", chat_id)
         return "记下了，下次遇到类似说法本鱼会注意。"
 
+    # 文字确认：微信没有卡片按钮，靠回一句「确认入库/确认发送/确认报名」执行。
+    # 飞书走自己的卡片回调，这里对它是新增入口，不改变原行为。
+    quick = _text_confirm(text or "", chat_id)
+    if quick:
+        return quick
+
     # 写操作不走模型：模型爱自己加戏（「人格能改课表改不了」），代码直接出结果
     if "修改木鱼" in (text or ""):
         direct = _handle_write_instruction(text or "", chat_id)
@@ -3325,6 +3331,95 @@ def match_activity(text: str, chat_id: str | None = None) -> dict | None:
     return None
 
 
+# ---------- 文字确认（微信没有卡片按钮，改成回一句话执行） ----------
+# 飞书仍走卡片回调，这里只多一条文字入口，不影响原流程。
+_PENDING_SIGNUP: dict[str, dict] = {}
+_CONFIRM_KB_RE = re.compile(r"^(?:确认)?(?:入库|收录)$")
+_CONFIRM_MAIL_RE = re.compile(r"^(?:确认)?发送$|^发送吧$|^发吧$")
+_CANCEL_RE = re.compile(r"^(?:取消|算了|不发了|不报了|不入库了)$")
+_CONFIRM_APPLY_RE = re.compile(r"^确认报名$|^报名吧$")
+
+
+def _text_confirm(text: str, chat_id: str | None) -> str | None:
+    if not chat_id:
+        return None
+    t = (text or "").strip()
+    # 取消要排在最前：否则「不发送了」会被下面的发送分支先抢走
+    if _CANCEL_RE.match(t):
+        cleared = False
+        got = take_mail_draft(chat_id)
+        if got:
+            drop_mail_draft(got[0])
+            cleared = True
+        from app.tools import kb as _kb
+
+        staged = _kb.take_for_chat(chat_id)
+        if staged:
+            _kb.drop(staged[0])
+            cleared = True
+        if _PENDING_SIGNUP.pop(str(chat_id), None):
+            cleared = True
+        return "好，这次不弄了。" if cleared else None
+    if _CONFIRM_KB_RE.match(t):
+        from app.tools import kb
+
+        got = kb.take_for_chat(chat_id)
+        if not got:
+            return "没有待入库的资料。先把链接发本鱼（说「收录 网址」）。"
+        _token, candidate = got
+        result = kb.save(candidate, verified=True)
+        if result.get("ok"):
+            return "入库好了，下次问这个本鱼就能直接答。"
+        return "这条没入库：%s" % (result.get("reason") or "未知原因")
+    # 有草稿时句子里带「发送」就算确认；提到「发送 + 邮件」但没草稿时，
+    # 要明确说「没有草稿」，不能静默落到查收件箱（他实测过两次）
+    has_draft = str(chat_id) in _MAIL_BY_CHAT
+    wants_send = bool(_CONFIRM_MAIL_RE.match(t)) or bool(
+        re.search(r"(发送|发出去|发掉|发吧)", t)
+        and (has_draft or re.search(r"邮件", t))
+    )
+    if wants_send:
+        got = take_mail_draft(chat_id)
+        if not got:
+            return "没有待发送的邮件。先说清楚发给谁、说什么。"
+        token, draft = got
+        from app.tools import mail as mail_tool
+
+        result = mail_tool.send(draft["to"], draft["subject"], draft["body"])
+        drop_mail_draft(token)
+        if result.get("ok"):
+            return "邮件发出去了\n收件人：%s\n主题：%s" % (draft["to"], draft["subject"])
+        return "没发出去：%s" % (result.get("reason") or "未知原因")
+    if _CONFIRM_APPLY_RE.match(t):
+        item = _PENDING_SIGNUP.pop(str(chat_id), None)
+        if not item:
+            return "没有待报名的活动。先问「这周有啥活动」，再点名要报哪个。"
+        from app.tools.hduhelp import HduhelpError, apply_activity
+
+        name = item.get("activityName") or "这个活动"
+        try:
+            result = apply_activity(item["id"])
+        except HduhelpError as exc:
+            msg = str(exc)
+            if "40920" in msg or "服务授权" in msg:
+                return (
+                    "报名没成：杭电助手的「二课活动」服务授权没开。"
+                    "打开「杭电助手」→ 我的/设置 → 服务授权 → 二课活动 → 同意，再回一次「确认报名」。"
+                )
+            if "MISSING_SCOPE" in msg or "scope" in msg.lower() or "权限" in msg:
+                return "报名没成：缺报名写权限，重新授权一次、把写权限勾上再来。"
+            if "已报名" in msg or "重复" in msg:
+                return "这个活动你已经报过了，不用重复。"
+            return "报名没成：%s" % msg
+        except Exception as exc:
+            return "报名出错：%s" % type(exc).__name__
+        data = result.get("data") or {}
+        if data.get("registered") or data.get("success") or data.get("verified"):
+            return f"报名成功：{name}\n\n临时去不了的话，去「青春杭电」→ 第二课堂取消。"
+        return "报名没成功：%s" % (result.get("msg") or "接口没返回成功状态")
+    return None
+
+
 def format_activity_confirm(activity: dict) -> str:
     name = activity.get("activityName") or "未命名活动"
     lines = [f"**{name}**"]
@@ -3344,11 +3439,15 @@ def format_activity_confirm(activity: dict) -> str:
 
 
 def handle_activity_signup(text: str, chat_id: str | None = None) -> str:
-    """命令行版本；飞书里由 bot 直接弹确认卡片。"""
+    """命令行版本；飞书里由 bot 直接弹确认卡片，微信侧回一句「确认报名」执行。"""
     activity = match_activity(text)
     if not activity:
-        return "没找到这个活动。先发「这周有啥活动」看看有哪些在报名，再说全名。"
-    return format_activity_confirm(activity) + "\n\n（在飞书里会弹出「确认报名」按钮）"
+        # 只说了「二课报名」没点名报哪个：先给列表，再告诉他怎么挑
+        body = handle_activities(text=text, chat_id=chat_id)
+        return body + "\n\n要报哪个就回「报名：活动名」，本鱼再跟你确认一遍。"
+    if chat_id and activity.get("id"):
+        _PENDING_SIGNUP[str(chat_id)] = activity
+    return format_activity_confirm(activity) + "\n\n要报名就回一句「确认报名」，不想报就算了。"
 
 
 def handle_library() -> str:
@@ -3625,6 +3724,43 @@ _MAIL_BY_CHAT: dict[str, str] = {}
 _MAIL_TTL = 600
 
 
+def _draft_file():
+    from app.config import DATA_DIR
+
+    return DATA_DIR / "mail_drafts.json"
+
+
+def _save_drafts() -> None:
+    """草稿落盘：以前只放内存，重启一次就丢，用户回「发送」时会以为没这回事。"""
+    try:
+        import json as _json
+
+        path = _draft_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            _json.dumps({"drafts": _MAIL_DRAFTS, "by_chat": _MAIL_BY_CHAT}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _load_drafts() -> None:
+    try:
+        import json as _json
+
+        data = _json.loads(_draft_file().read_text(encoding="utf-8"))
+        now = time.time()
+        for token, item in (data.get("drafts") or {}).items():
+            if isinstance(item, dict) and now - float(item.get("created") or 0) <= _MAIL_TTL:
+                _MAIL_DRAFTS[token] = item
+        for chat, token in (data.get("by_chat") or {}).items():
+            if token in _MAIL_DRAFTS:
+                _MAIL_BY_CHAT[chat] = token
+    except (OSError, ValueError):
+        pass
+
+
 def _parse_mail_draft(text: str) -> dict:
     """抽收件人、主题、正文。收件人用正则（模型常写错邮箱），主题正文让模型归纳。"""
     import json
@@ -3689,6 +3825,7 @@ def handle_mail_send(text: str, chat_id: str | None = None) -> str:
     _MAIL_DRAFTS[token] = draft
     if chat_id:
         _MAIL_BY_CHAT[chat_id] = token
+    _save_drafts()
 
     body_preview = draft["body"] if len(draft["body"]) <= 300 else draft["body"][:300] + "…"
     return (
@@ -3696,7 +3833,7 @@ def handle_mail_send(text: str, chat_id: str | None = None) -> str:
         f"收件人：{draft['to']}\n"
         f"主题：{draft['subject']}\n"
         f"正文：{body_preview}\n\n"
-        "确认无误点「发送」，不想发点「取消」。"
+        "确认无误就回一句「发送」，不想发就回「取消」。"
     )
 
 
@@ -3727,6 +3864,17 @@ def get_mail_draft(token: str) -> dict | None:
 
 def drop_mail_draft(token: str) -> None:
     _MAIL_DRAFTS.pop(token, None)
+    for chat, kept in list(_MAIL_BY_CHAT.items()):
+        if kept == token:
+            _MAIL_BY_CHAT.pop(chat, None)
+    _save_drafts()
+
+
+# 启动时把上次没发的草稿捡回来（10 分钟内有效），重启不用重说一遍
+try:
+    _load_drafts()
+except Exception:
+    pass
 
 
 def handle_usage() -> str:
