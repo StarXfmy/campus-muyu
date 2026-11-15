@@ -184,6 +184,49 @@ def _image_answer(text: str, chat_id: str | None, is_master: bool) -> str | None
     return "消费图给你\n[[IMG:%s]]" % path
 
 
+_REMIND_INTENTS = frozenset({"remind", "edit_remind", "cancel_remind", "my_reminders"})
+
+_REMIND_OFF_WECHAT = (
+    "设提醒得去飞书那边说一声。\n\n"
+    "不是本鱼不肯记——记了在微信里到点也发不出来，与其应下来不办，不如说清楚。"
+)
+
+
+# 微信端不接提醒，追问里再推荐「设个提醒」就是点不动的选项
+_REMIND_HINTS = ("设个提醒", "设个明早提醒", "我的提醒有哪些")
+
+
+def _drop_remind_hints(reply: str) -> str:
+    marker = "—— 你可能还想问："
+    if marker not in reply:
+        return reply
+    head, tail = reply.split(marker, 1)
+    kept = []
+    for line in tail.splitlines():
+        item = line.strip().lstrip("·").strip()
+        if item and not any(k in item for k in _REMIND_HINTS):
+            kept.append(item)
+    if not kept:
+        return head.rstrip()
+    return head + marker + "\n" + "\n".join("· " + item for item in kept)
+
+
+def _trim_group_reply(reply: str, limit: int = 70) -> str:
+    """群里一句话回答压在 70 字内。
+
+    带换行的清单、课表、活动列表不截——截了剩下的半张表更没法看，
+    而且群里问这些本来就是要把条目列全。
+    """
+    if "\n" in reply or len(reply) <= limit:
+        return reply
+    cut = reply[:limit]
+    for mark in ("。", "！", "？", "；", "，"):
+        pos = cut.rfind(mark)
+        if pos >= int(limit * 0.5):
+            return cut[: pos + 1]
+    return cut.rstrip() + "…"
+
+
 def _multi_reply(text: str, chat_id: str, is_master: bool = False) -> str | None:
     """微信入口与飞书走同一条主链：handlers.answer_blocks。
 
@@ -291,12 +334,29 @@ class Handler(BaseHTTPRequestHandler):
         chat_id = f"wx:{payload.get('chatType') or 'private'}:{payload.get('chatId') or ''}"
         _ctx.scene = build_scene(payload)
         try:
-            reply = _multi_reply(text, chat_id, payload.get("isMaster") is True)
+            from app.agent import handlers as _h
+            from app.agent import router as _r
+
+            if payload.get("isMaster") is True and _h.is_clear_context(text):
+                # 只认主人：这是删数据的指令，混人群里一句「清空历史」不该动到别人
+                reply = _h.handle_clear_context(chat_id)
+            elif _r.detect(text, chat_id).name in _REMIND_INTENTS:
+                # 微信端不接提醒：reminders 到点没有任何链路写进 wx_outbox
+                # （push_scheduler.pending() 只读 outbox），答应他就是开一张永远兑不了的空头支票。
+                # 提醒本身没删，飞书那边的云端 scheduler 会正常推。
+                reply = _REMIND_OFF_WECHAT
+            else:
+                reply = _multi_reply(text, chat_id, payload.get("isMaster") is True)
         except Exception as exc:  # noqa: BLE001
             print(f"[chat] run 失败：{exc!r}", flush=True)
             reply = None
         finally:
             _ctx.scene = ""
+
+        if reply:
+            reply = _drop_remind_hints(reply)
+        if reply and (payload.get("chatType") or "") == "group":
+            reply = _trim_group_reply(reply)
 
         if reply:
             try:

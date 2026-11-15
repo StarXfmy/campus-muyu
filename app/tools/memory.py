@@ -56,6 +56,75 @@ def _touch() -> None:
         pass
 
 
+_CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "十五": 15, "二十": 20,
+           "三十": 30, "四十五": 45}
+
+_RELATIVE_RE = re.compile(
+    r"(\d{1,3}|半|十五|二十|三十|四十五|[一二两三四五六七八九十])\s*"
+    r"(秒钟|秒|s|S|分钟|分|小时|钟头)\s*"
+    r"(?:以?后|之后|后)"
+)
+
+
+def _rel_number(tok: str) -> int | None:
+    if tok.isdigit():
+        return int(tok)
+    if tok in _CN_NUM:
+        return _CN_NUM[tok]
+    return None
+
+
+def parse_relative_at(text: str) -> datetime | None:
+    """「30秒后」「5分钟后」「半小时后」「两小时后」→ 将来的时间点，算不出返回 None。
+
+    提醒时间原先全靠模型给 YYYY-MM-DD HH:MM：分钟粒度下「30 秒后」有一半概率
+    落在当前这一分钟，被当成已经过期拒掉。这类说法代码算得又准又稳，不该问模型。
+    """
+    match = _RELATIVE_RE.search(text or "")
+    if not match:
+        return None
+    tok, unit = match.group(1), match.group(2)
+    now = datetime.now()
+    if unit in ("秒", "秒钟", "s", "S"):
+        n = _rel_number(tok)
+        if n is None:
+            return None
+        when = now + timedelta(seconds=n)
+    elif tok == "半":
+        when = now + timedelta(minutes=30)
+    else:
+        n = _rel_number(tok)
+        if n is None:
+            return None
+        when = now + (timedelta(hours=n) if unit in ("小时", "钟头") else timedelta(minutes=n))
+    # 存储只到分钟，落在当前这一分钟会被判过期，所以至少推到下一分钟
+    when = when.replace(second=0, microsecond=0)
+    if when <= now:
+        when += timedelta(minutes=1)
+    return when
+
+
+_ABSOLUTE_TIME_RE = re.compile(
+    r"(大后天|后天|明天|明日|今日|今天|"
+    r"(?:[下本这上])?周[一二三四五六日天]|本周|这周|下周|上周|"
+    r"星期[一二三四五六日天]|礼拜[一二三四五六日天]|"
+    r"半[小时钟]|(?:上午|早上|中午|下午|傍晚|晚上)?\s*(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*[点时](?:\s*(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*分?|\s*半)?|"
+    r"\d{1,2}\s*月\s*\d{1,2}\s*[日号])"
+)
+
+
+def strip_time_phrase(text: str) -> str:
+    """剥掉句子里的时间说法，留下要做的本身。
+
+    给「模型没抽到内容」时代码兜底用：时间已经能自己算了，事项不该再卡在
+    模型那一次抽取上（实测 4 次里有 1 次 content 返回空，整条提醒就废了）。
+    """
+    raw = _RELATIVE_RE.sub("", text or "")
+    raw = _ABSOLUTE_TIME_RE.sub("", raw)
+    return raw.strip(" ，,。、")
+
+
 def parse_remind_at(text: str) -> str:
     """从记忆原话里抓提醒时间，抓不到返回空串。
 

@@ -239,7 +239,7 @@ _TIMEOUT = 8
 # 原来是 5 秒。实测这台机器到 open-meteo 正常就要 1.4–4.1 秒，抖动一次就撞线，
 # 于是整次天气查询被误判成失败、退回实况兜底（用户看到「明天的预报暂时没拿到」）。
 _CACHE_TTL = 10 * 60  # 天气预报 10 分钟内不会变
-_FAIL_COOLDOWN = 60  # 刚失败过就先走兜底，别让下一条消息再等 5 秒
+_FAIL_COOLDOWN = 15  # 刚失败过就先走兜底；15 秒够避开这一波抖动，又不至于让下个话题也拿不到预报
 
 _CACHE: dict[str, tuple[float, dict]] = {}
 _FAILED_AT: dict[str, float] = {}
@@ -419,7 +419,12 @@ def fetch(city: str | dict = "") -> dict:
         "&hourly=temperature_2m,weathercode,precipitation_probability"
     )
     try:
-        data = _parse(_fetch(url), name)
+        try:
+            data = _parse(_fetch(url), name)
+        except Exception:
+            # 这台机器到 open-meteo 正常 2.8 秒，但实测出现过整段不通（>20 秒）。
+            # 一次超时不代表拿不到预报，紧接着再要一次比退回实况有用得多。
+            data = _parse(_fetch(url), name)
     except Exception as exc:
         _mark_failed(name)
         _warm(name, url)

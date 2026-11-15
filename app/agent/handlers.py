@@ -1364,6 +1364,37 @@ def _handle_write_instruction(text: str, chat_id: str | None) -> str | None:
     return None
 
 
+_CLEAR_CTX_RE = re.compile(
+    r"(?:清空|清掉|清除|忘掉|忘了|删掉|删除)\s*"
+    r"(?:刚才|之前|前面|上面|这些|那些|最近|说的|讲的|聊的|咱们|我们)*\s*"
+    r"(?:上下文|聊天记录|聊天|对话|历史|说过的事|聊的|说的)"
+    # 「把聊天记录清掉」这种宾动倒装也要认
+    r"|把?\s*(?:上下文|聊天记录|历史|对话)\s*(?:清空|清掉|清除|删掉|删除|忘掉|忘了)"
+)
+
+
+def is_clear_context(text: str) -> bool:
+    """这句话是不是「把喂给我的上下文清掉」。只当指令用，不当查询。"""
+    raw = (text or "").strip()
+    if len(raw) > 24:
+        return False
+    return bool(_CLEAR_CTX_RE.search(raw))
+
+
+def handle_clear_context(chat_id: str | None) -> str:
+    """删掉这个会话的对话历史与最近两轮摘要；长期记忆、提醒、课表一律不动。"""
+    if not chat_id:
+        return "得先知道是哪个会话，本鱼才好清。"
+    from app.agent import context
+
+    counts = context.clear(chat_id)
+    return (
+        "上下文清掉了。\n"
+        f"对话历史删了 {counts['conversations']} 条，最近摘要删了 {counts['turn_summaries']} 条。\n\n"
+        "长期记忆、提醒、课表都没动——那些不是你让本鱼忘的东西。"
+    )
+
+
 def _needs_deep_agent(text: str, intent) -> bool:
     """规则和 FAQ 只能答一半的复合问题，交给 SDK 接着往下查。
 
@@ -1391,10 +1422,15 @@ def _faq_worthy(text: str, intent) -> bool:
     if _needs_deep_agent(text, intent):
         return False
     return (
-        (intent.name == router.INTENT_BALANCE and any(k in text for k in ("丢", "补办", "挂失", "消磁")))
+        # 校园卡补办类：意图名靠不住（「校园卡丢了」会被失物招领抢走），按文本判
+        (any(k in text for k in ("校园卡", "饭卡", "一卡通"))
+         and any(k in text for k in ("丢", "补办", "挂失", "消磁", "充值")))
+        or (intent.name == router.INTENT_BALANCE and any(k in text for k in ("丢", "补办", "挂失", "消磁")))
         or (intent.name == router.INTENT_GRADE and any(k in text for k in ("单", "证明", "打印", "开一份")))
         or intent.name == router.INTENT_UNKNOWN
-        or any(k in text for k in _HOW_HINTS)
+        # 「怎么/如何/在哪」只在意图不明时才当操作类问题去查题库。
+        # 原先是无条件生效，结果「上周校园卡开销如何」被拉去答校园卡使用说明。
+        or (intent.name == router.INTENT_UNKNOWN and any(k in text for k in _HOW_HINTS))
     )
 
 
@@ -2301,10 +2337,8 @@ def sync_consumption() -> int:
     if not spends:
         return 0
 
-    added = 0
-    for chat_id in records.expense_chat_ids():
-        added += records.log_expenses(chat_id, spends)
-    return added
+    # 公账一份：以前按会话各存一份，同一张卡微信查 9 笔、飞书查 5 笔
+    return records.log_expenses("sync", spends)
 
 
 def handle_electric(chat_id: str | None = None) -> str:
@@ -2441,11 +2475,21 @@ def handle_remind(text: str, chat_id: str | None = None) -> str:
 
     content = str((parsed or {}).get("content") or "").strip()
     if not content:
+        # 模型没抽到事项时代码兜底：时间已经能自己算，剩下的剥掉「提醒我」就是要做的事
+        content = re.sub(
+            r"(提醒我|提醒一下|叫我一声|叫我|记得提醒|别忘了提醒|通知我|提醒)",
+            "",
+            memory.strip_time_phrase(text),
+        ).strip(" ，,。！!")
+    if not content:
         return "没听清要提醒什么。换个说法试试，比如「明天早上 8 点提醒我交作业」。"
 
     # 时间优先用代码算：模型没听到具体几点时会填 00:00
-    code_time = memory.parse_remind_at(text)
-    if code_time:
+    relative = memory.parse_relative_at(text)
+    code_time = "" if relative else memory.parse_remind_at(text)
+    if relative:
+        when = relative
+    elif code_time:
         when = datetime.strptime(code_time, "%Y-%m-%d %H:%M")
     else:
         raw_time = str((parsed or {}).get("remind_at") or "").strip()
@@ -3064,10 +3108,11 @@ def handle_edit_remind(text: str, chat_id: str | None = None) -> str:
         return f"没找到编号 {reminder_id} 的待触发提醒。"
 
     when_text = re.sub(r"(修改提醒|改提醒|提醒改成|改一下提醒|提醒时间改|改成|改为|编号)", "", text)
-    when_raw = memory.parse_remind_at(when_text) or memory.parse_remind_at(text)
-    if not when_raw:
+    relative = memory.parse_relative_at(when_text) or memory.parse_relative_at(text)
+    when_raw = "" if relative else (memory.parse_remind_at(when_text) or memory.parse_remind_at(text))
+    if not relative and not when_raw:
         return "没听清新的时间。说「修改提醒 3 改成明天下午3点」这样。"
-    when = datetime.strptime(when_raw, "%Y-%m-%d %H:%M")
+    when = relative or datetime.strptime(when_raw, "%Y-%m-%d %H:%M")
     if when <= datetime.now():
         return f"这个时间（{when:%m-%d %H:%M}）已经过了，换一个将来的时间。"
     if reminders.reschedule(chat_id, reminder_id, when):

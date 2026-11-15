@@ -100,6 +100,61 @@ def _ensure_all(conn: sqlite3.Connection) -> None:
     schedule_store._ensure(conn)
 
 
+def _expense_key(row: dict) -> tuple[str, str, str]:
+    """流水的行级身份：同一天 + 同金额 + 同店名算同一笔。金额归一到两位小数，
+    免得 5.15 和 5.150 被当成两笔。"""
+    try:
+        amount = "%.2f" % float(row.get("amount"))
+    except (TypeError, ValueError):
+        amount = str(row.get("amount") or "").strip()
+    return (str(row.get("day") or "").strip(), amount, str(row.get("place") or "").strip())
+
+
+def _merge_expenses(remote: list[dict]) -> int:
+    """把远端流水并进本地，本地独有的不动，返回新增笔数。
+
+    刻意不走 _apply 那种「先删表再整表插」：两端都会各自补录消费，覆盖式同步
+    会把对端刚记的那笔冲掉。
+    """
+    if not remote:
+        return 0
+    conn = _connect()
+    try:
+        have = {_expense_key(dict(r)) for r in conn.execute(
+            "SELECT day, amount, place FROM expense_log"
+        ).fetchall()}
+    finally:
+        conn.close()
+    added = 0
+    conn = _connect()
+    try:
+        for row in remote:
+            key = _expense_key(row)
+            if not key[0] or key in have:
+                continue
+            try:
+                amount = float(row.get("amount"))
+            except (TypeError, ValueError):
+                continue
+            conn.execute(
+                "INSERT INTO expense_log (chat_id, happened_at, day, amount, place) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    str(row.get("chat_id") or "sync"),
+                    str(row.get("happened_at") or ""),
+                    key[0],
+                    amount,
+                    key[2],
+                ),
+            )
+            have.add(key)
+            added += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return added
+
+
 def _dump() -> dict:
     conn = _connect()
     _ensure(conn)
@@ -122,6 +177,12 @@ def _dump() -> dict:
                 "start_time, end_time, weeks, created_at FROM schedule_custom ORDER BY id"
             ).fetchall()
         ]
+        expenses = [
+            dict(r) for r in conn.execute(
+                "SELECT id, chat_id, day, amount, place, happened_at "
+                "FROM expense_log ORDER BY id"
+            ).fetchall()
+        ]
     finally:
         conn.close()
     return {
@@ -130,11 +191,16 @@ def _dump() -> dict:
         "memories": memories,
         "persona_rules": rules,
         "schedule_custom": customs,
+        "expenses": expenses,
     }
 
 
 def _apply(payload: dict) -> None:
-    """用远端数据覆盖本地三张表。id 保留，方便 undo 的顺序不变。"""
+    """用远端数据覆盖本地三张表。id 保留，方便 undo 的顺序不变。
+
+    流水不在这里——两端都会各自补录，覆盖会冲掉对端新记的那笔，
+    所以走 _merge_expenses() 做行级合并。
+    """
     memories = payload.get("memories") or []
     rules = payload.get("persona_rules") or []
     customs = payload.get("schedule_custom") or []
@@ -276,7 +342,7 @@ def _push(payload: dict) -> int:
 
 def _count(payload: dict) -> int:
     return sum(len(payload.get(k) or []) for k in (
-        "memories", "persona_rules", "schedule_custom",
+        "memories", "persona_rules", "schedule_custom", "expenses",
     ))
 
 
@@ -295,16 +361,24 @@ def _sync_once() -> None:
             except ValueError:
                 payload = None
             if isinstance(payload, dict):
+                merged = _merge_expenses(payload.get("expenses") or [])
+                if merged:
+                    log("流水合并新增 ", merged, " 笔")
+                local_count = _count(_dump())
                 # 首次对表时谁的数据多用谁，避免刚开通就被空表冲掉
-                if first_time and _count(_dump()) > _count(payload):
+                if first_time and local_count > _count(payload):
                     pass
                 elif remote["updated_at"] > local_ms:
                     _apply(payload)
                     _set(local_dirty="0", local_ms=str(remote["updated_at"]),
                          last_remote_ms=str(remote["updated_at"]))
                     log("已拉取远端（", remote["updated_at"], "）")
-                    return
-                elif not dirty:
+                    if not merged:
+                        return
+                    # 合并进了新流水就得把并集推回去，不然另一端永远看不到
+                elif not dirty and not merged and local_count <= _count(payload):
+                    # 「没变化」不能只看 dirty：远端快照还是旧结构（不带 expenses 字段）时，
+                    # dirty=0、merged=0，本地 30 条流水就永远推不上去（实测复现过）。
                     _set(last_remote_ms=str(remote["updated_at"]))
                     return
 

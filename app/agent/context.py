@@ -47,6 +47,15 @@ def remember(chat_id: str, user_text: str, intent: str, bot_text: str = "") -> N
     _ensure(conn)
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 同一句话在 15 秒内被记两次 = 入口链和主链各写了一遍（微信端实测每条历史翻倍）。
+        # 历史翻倍不只是浪费 token：模型会当成「这句刚说过」，接着上一句重复回答。
+        cutoff = (datetime.now() - timedelta(seconds=15)).strftime("%Y-%m-%d %H:%M:%S")
+        if conn.execute(
+            "SELECT 1 FROM conversations WHERE chat_id = ? AND role = 'user' AND text = ? "
+            "AND created_at >= ? LIMIT 1",
+            (chat_id, user_text[:500], cutoff),
+        ).fetchone():
+            return
         conn.execute(
             "INSERT INTO conversations (chat_id, role, text, intent, created_at) VALUES (?,?,?,?,?)",
             (chat_id, "user", user_text[:500], intent, now),
@@ -126,14 +135,25 @@ def recent(chat_id: str, limit: int = 10) -> list[dict[str, Any]]:
     return [{"role": r[0], "text": r[1]} for r in reversed(rows)]
 
 
-def clear(chat_id: str) -> None:
+def clear(chat_id: str) -> dict[str, int]:
+    """清掉这个会话喂给模型的上下文缓存：对话历史 + 最近两轮摘要。
+
+    长期记忆、提醒、课表都不动——那些是用户让本鱼记下来的东西，不是缓存。
+    """
+    counts = {"conversations": 0, "turn_summaries": 0}
+    if not chat_id:
+        return counts
     conn = connect()
     _ensure(conn)
     try:
-        conn.execute("DELETE FROM conversations WHERE chat_id = ?", (chat_id,))
+        for table in counts:
+            counts[table] = conn.execute(
+                f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,)
+            ).rowcount
         conn.commit()
     finally:
         conn.close()
+    return counts
 
 
 # ---- 短期上下文：只给下一两轮接话用，不写长期记忆 ----

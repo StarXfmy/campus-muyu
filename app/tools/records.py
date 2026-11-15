@@ -1,8 +1,11 @@
 """学期报告的数据积累。
 
 消费接口只返回最近 15 笔，不落库的话过几周就查不到历史了；
-所以每次查消费顺手把明细存下来（按「时间+金额+店铺」去重）。
+所以每次查消费顺手把明细存下来（按「时间+金额」去重）。
 其余指标（长跑、电费、余额）是累计值，现查即可，只记快照用于趋势。
+
+流水是一份公账，不按会话分仓：同一个人从微信问和从飞书问必须得到同一个数。
+chat_id 只留作「这笔是哪次查询带进来的」来源标记，查询和去重都不看它。
 """
 from __future__ import annotations
 
@@ -29,7 +32,7 @@ def _ensure(conn: sqlite3.Connection) -> None:
             day TEXT NOT NULL,
             amount REAL NOT NULL,
             place TEXT NOT NULL DEFAULT '',
-            UNIQUE(chat_id, happened_at, amount, place)
+            UNIQUE(happened_at, amount)
         )"""
     )
     conn.execute(
@@ -59,7 +62,7 @@ def log_expenses(chat_id: str, spends: list[dict]) -> int:
                    SELECT ?, ?, ?, ?, ?
                    WHERE NOT EXISTS (
                        SELECT 1 FROM expense_log
-                       WHERE chat_id = ? AND happened_at = ? AND amount = ?
+                       WHERE happened_at = ? AND amount = ?
                    )""",
                 (
                     chat_id,
@@ -67,7 +70,6 @@ def log_expenses(chat_id: str, spends: list[dict]) -> int:
                     str(item.get("day") or ""),
                     float(item.get("amount") or 0),
                     str(item.get("place") or ""),
-                    chat_id,
                     str(item.get("time") or ""),
                     float(item.get("amount") or 0),
                 ),
@@ -79,26 +81,17 @@ def log_expenses(chat_id: str, spends: list[dict]) -> int:
     return added
 
 
-def expense_chat_ids() -> list[str]:
-    """有消费记录落过库的会话，定时快照按这些会话补数据。"""
-    conn = connect()
-    _ensure(conn)
-    try:
-        rows = conn.execute(
-            "SELECT DISTINCT chat_id FROM expense_log WHERE chat_id != ''"
-        ).fetchall()
-        return [str(r["chat_id"]) for r in rows]
-    finally:
-        conn.close()
-
-
 def range_summary(chat_id: str, start: str, end: str | None = None) -> dict:
-    """区间内消费汇总，和消费图同源，避免文字说 9 笔、图里却画了 8 天。"""
+    """区间内消费汇总，和消费图同源，避免文字说 9 笔、图里却画了 8 天。
+
+    chat_id 保留在签名里是给调用方省事的，查询不看它——公账一份，
+    微信问和飞书问必须得到同一个数。
+    """
     conn = connect()
     _ensure(conn)
     try:
-        sql = "SELECT day, amount, place FROM expense_log WHERE chat_id = ? AND day >= ?"
-        params: list = [chat_id, start]
+        sql = "SELECT day, amount, place FROM expense_log WHERE day >= ?"
+        params: list = [start]
         if end:
             sql += " AND day <= ?"
             params.append(end)
@@ -150,13 +143,11 @@ def log_snapshot(chat_id: str, kind: str, payload: dict) -> None:
 
 
 def expense_summary(chat_id: str) -> dict:
-    """学期报告用：累计花了多少、几笔、常去哪。"""
+    """学期报告用：累计花了多少、几笔、常去哪。同样不看 chat_id，公账一份。"""
     conn = connect()
     _ensure(conn)
     try:
-        rows = conn.execute(
-            "SELECT day, amount, place FROM expense_log WHERE chat_id = ?", (chat_id,)
-        ).fetchall()
+        rows = conn.execute("SELECT day, amount, place FROM expense_log").fetchall()
     finally:
         conn.close()
     if not rows:
